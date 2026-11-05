@@ -11,6 +11,7 @@ import mmap
 import os
 import socket
 import struct
+import threading
 import time
 import zlib
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -21,6 +22,8 @@ from PIL import Image
 
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
+
+SHARE_READ_S = 0.04  # viewers polling within this window reuse the last framebuffer read
 
 class FbVarScreeninfo(ctypes.Structure):
     _fields_ = [
@@ -130,6 +133,7 @@ class Framebuffer:
         self._cache_raw = None
         self._cache_png = None
         self._cache_time = 0
+        self._lock = threading.Lock()
         self._open()
 
     def _open(self):
@@ -151,26 +155,33 @@ class Framebuffer:
         log(f"Framebuffer: {self.width}x{self.height} ({self.virtual_width}x{self.virtual_height} virtual) @ {self.bpp}bpp, line_length={self.line_length}")
 
     def get_snapshot(self, client_etag=None):
+        # All viewers share one framebuffer read: re-read at most every SHARE_READ_S.
+        with self._lock:
+            if time.monotonic() - self._cache_time >= SHARE_READ_S:
+                self._read()
+                self._cache_time = time.monotonic()
+            raw_hash, png_data = self._cache_hash, self._cache_png
+        if client_etag and client_etag == raw_hash:
+            return raw_hash, None
+        return raw_hash, png_data
+
+    def _read(self):
         vinfo = FbVarScreeninfo()
         fcntl.ioctl(self.fd, FBIOGET_VSCREENINFO, vinfo)
         offset = vinfo.yoffset * self.line_length
 
         raw = self.mm[offset:offset + self.line_length * self.height]
         raw_hash = hashlib.md5(raw).hexdigest()[:16]
-        if client_etag and client_etag == raw_hash:
-            return raw_hash, None
         if raw_hash == self._cache_hash and self._cache_png:
-            return raw_hash, self._cache_png
+            return
         if self.bpp == 32:
             img = Image.frombytes('RGB', (self.width, self.height), raw, 'raw', 'BGRX', self.line_length)
         elif self.bpp == 16:
             img = Image.frombytes('RGB', (self.width, self.height), raw, 'raw', 'BGR;16', self.line_length)
         else:
             img = Image.frombytes('RGB', (self.width, self.height), raw, 'raw', 'BGR', self.line_length)
-        png_data = self.encode_png(img)
+        self._cache_png = self.encode_png(img)
         self._cache_hash = raw_hash
-        self._cache_png = png_data
-        return raw_hash, png_data
 
     def close(self):
         if self.mm:

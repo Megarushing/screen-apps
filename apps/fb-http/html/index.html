@@ -141,8 +141,8 @@ async function stream() {
 // poll /snapshot only when the server has no /stream.
 let fpsTimer, pollTimer;
 function connect() {
-    fpsTimer ??= setInterval(() => { status.textContent = frameCount + ' fps'; frameCount = 0; }, 1000);
-    stream().then(() => pollTimer ??= setInterval(updateImage, 100), () => setTimeout(connect, 1000));
+    if (!fpsTimer) fpsTimer = setInterval(() => { status.textContent = frameCount + ' fps'; frameCount = 0; }, 1000);
+    stream().then(() => { if (!pollTimer) pollTimer = setInterval(updateImage, 100); }, () => setTimeout(connect, 1000));
 }
 window.addEventListener('load', connect);
 

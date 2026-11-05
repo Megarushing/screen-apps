@@ -53,8 +53,6 @@ function showFrame(blob) {
     frameCount++;
 }
 
-setInterval(() => { status.textContent = frameCount + ' fps'; frameCount = 0; }, 1000);
-
 async function updateImage() {
     if (loading) return;
     loading = true;
@@ -86,38 +84,59 @@ async function updateImage() {
 }
 
 // Reads the multipart stream with fetch() so the auth header is kept
-// (an <img src="stream"> cannot send it). latin1 maps 1 byte to 1 char,
-// so the match position is the byte offset of the PNG.
+// (an <img src="stream"> cannot send it). Each part is
+// "--frame", headers, blank line, Content-Length bytes of PNG, CRLF.
 const latin1 = new TextDecoder('latin1');
-const PART = /Content-Length: (\d+)\r\n\r\n/i;
-let streamed = false;
+const PART = /^--frame\r\n[^]*?Content-Length: (\d+)\r\n\r\n/i;
+const MAX_FRAME = 1 << 20;
+
+function concat(chunks, size) {
+    if (chunks.length === 1) return chunks[0];
+    const buf = new Uint8Array(size);
+    let pos = 0;
+    for (const c of chunks) { buf.set(c, pos); pos += c.length; }
+    return buf;
+}
 
 async function stream() {
     const resp = await fetch('stream', { headers: window.getAuthHeaders ? getAuthHeaders() : {} });
+    if (resp.status === 404) return 'no stream';
     if (!resp.ok || !resp.body) throw new Error(resp.status);
-    streamed = true;
     const reader = resp.body.getReader();
-    let buf = new Uint8Array(0);
+    let chunks = [], size = 0, need = 1;
     for (;;) {
         const { value, done } = await reader.read();
         if (done) throw new Error('stream closed');
-        const joined = new Uint8Array(buf.length + value.length);
-        joined.set(buf);
-        joined.set(value, buf.length);
-        buf = joined;
-        let m;
-        while ((m = PART.exec(latin1.decode(buf.subarray(0, 128))))) {
-            const start = m.index + m[0].length, end = start + +m[1];
-            if (buf.length < end) break;
-            showFrame(new Blob([buf.subarray(start, end)], { type: 'image/png' }));
+        chunks.push(value);
+        size += value.length;
+        if (size < need) continue;
+        // Join once per frame, not once per network chunk.
+        let buf = concat(chunks, size);
+        for (;;) {
+            const m = PART.exec(latin1.decode(buf.subarray(0, 256)));
+            if (!m) {
+                if (buf.length >= 256) throw new Error('bad part header');
+                need = buf.length + 1;
+                break;
+            }
+            const len = +m[1], start = m[0].length, end = start + len + 2;
+            if (len > MAX_FRAME) throw new Error('frame too big');
+            if (buf.length < end) { need = end; break; }
+            showFrame(new Blob([buf.subarray(start, start + len)], { type: 'image/png' }));
             buf = buf.subarray(end);
+            need = 1;
         }
+        chunks = buf.length ? [buf] : [];
+        size = buf.length;
     }
 }
 
-// Push stream when available, reconnect if it drops; poll /snapshot if it never connects.
+// Push stream when available, retry every 1s if it fails or drops;
+// poll /snapshot only when the server has no /stream.
+let fpsTimer, pollTimer;
 function connect() {
-    stream().catch(() => streamed ? setTimeout(connect, 1000) : setInterval(updateImage, 100));
+    fpsTimer ??= setInterval(() => { status.textContent = frameCount + ' fps'; frameCount = 0; }, 1000);
+    stream().then(() => pollTimer ??= setInterval(updateImage, 100), () => setTimeout(connect, 1000));
 }
 window.addEventListener('load', connect);
 

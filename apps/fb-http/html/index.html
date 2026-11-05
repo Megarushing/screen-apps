@@ -89,6 +89,7 @@ async function updateImage() {
 const latin1 = new TextDecoder('latin1');
 const PART = /^--frame\r\n[^]*?Content-Length: (\d+)\r\n\r\n/i;
 const MAX_FRAME = 1 << 20;
+const STALL_MS = 15000;
 
 function concat(chunks, size) {
     if (chunks.length === 1) return chunks[0];
@@ -99,14 +100,19 @@ function concat(chunks, size) {
 }
 
 async function stream() {
-    const resp = await fetch('stream', { headers: window.getAuthHeaders ? getAuthHeaders() : {} });
-    if (resp.status === 404) return 'no stream';
+    // The server sends a frame at least every 10s; 15s of silence means a dead connection.
+    const ctrl = new AbortController();
+    let watchdog = setTimeout(() => ctrl.abort(), STALL_MS);
+    const resp = await fetch('stream', { headers: window.getAuthHeaders ? getAuthHeaders() : {}, signal: ctrl.signal });
+    if (resp.status === 404) { clearTimeout(watchdog); return 'no stream'; }
     if (!resp.ok || !resp.body) throw new Error(resp.status);
     const reader = resp.body.getReader();
     let chunks = [], size = 0, need = 1;
     for (;;) {
         const { value, done } = await reader.read();
         if (done) throw new Error('stream closed');
+        clearTimeout(watchdog);
+        watchdog = setTimeout(() => ctrl.abort(), STALL_MS);
         chunks.push(value);
         size += value.length;
         if (size < need) continue;

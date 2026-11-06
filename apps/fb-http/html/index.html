@@ -88,58 +88,89 @@ async function updateImage() {
 // "--frame", headers, blank line, Content-Length bytes of PNG, CRLF.
 const latin1 = new TextDecoder('latin1');
 const PART = /^--frame\r\n[^]*?Content-Length: (\d+)\r\n\r\n/i;
+const MAX_HEADER = 1024;
 const MAX_FRAME = 1 << 20;
 const STALL_MS = 15000;
-
-function concat(chunks, size) {
-    if (chunks.length === 1) return chunks[0];
-    const buf = new Uint8Array(size);
-    let pos = 0;
-    for (const c of chunks) { buf.set(c, pos); pos += c.length; }
-    return buf;
-}
 
 async function stream() {
     // The server sends a frame at least every 10s; 15s of silence means a dead connection.
     const ctrl = new AbortController();
-    let watchdog = setTimeout(() => ctrl.abort(), STALL_MS);
-    const resp = await fetch('stream', {
-        headers: window.getAuthHeaders ? getAuthHeaders() : {},
-        signal: ctrl.signal
-    });
-    if (resp.status === 404) {
-        clearTimeout(watchdog);
-        return 'no stream';
+    let timer, reader, chunks = [], size = 0;
+
+    function reset() {
+        clearTimeout(timer);
+        timer = setTimeout(() => ctrl.abort(), STALL_MS);
     }
-    if (!resp.ok || !resp.body) throw new Error(resp.status);
-    const reader = resp.body.getReader();
-    let chunks = [], size = 0, need = 1;
-    for (;;) {
-        const { value, done } = await reader.read();
-        if (done) throw new Error('stream closed');
-        clearTimeout(watchdog);
-        watchdog = setTimeout(() => ctrl.abort(), STALL_MS);
-        chunks.push(value);
-        size += value.length;
-        if (size < need) continue;
-        // Join once per frame, not once per network chunk.
-        let buf = concat(chunks, size);
-        for (;;) {
-            const m = PART.exec(latin1.decode(buf.subarray(0, 256)));
-            if (!m) {
-                if (buf.length >= 256) throw new Error('bad part header');
-                need = buf.length + 1;
-                break;
-            }
-            const len = +m[1], start = m[0].length, end = start + len + 2;
-            if (len > MAX_FRAME) throw new Error('frame too big');
-            if (buf.length < end) { need = end; break; }
-            showFrame(new Blob([buf.subarray(start, start + len)], { type: 'image/png' }));
-            buf = buf.subarray(end);
-            need = 1;
+
+    function concat() {
+        if (chunks.length === 1) return chunks[0];
+        const out = new Uint8Array(size);
+        let pos = 0;
+        for (const c of chunks) {
+            out.set(c, pos);
+            pos += c.length;
         }
-        chunks = buf.length ? [buf] : [];
-        size = buf.length;
+        return out;
+    }
+
+    // Returns the first count bytes, or fewer if delimiter ends sooner.
+    async function readBytes(count, delimiter) {
+        while (true) {
+            // Join chunks only when they can hold the result, not on every network chunk.
+            if (size >= count || (delimiter && size)) {
+                const buf = concat();
+                let end = count;
+                if (delimiter) {
+                    const pos = latin1.decode(buf.subarray(0, count)).indexOf(delimiter);
+                    if (pos >= 0) end = pos + delimiter.length;
+                }
+                if (size >= end) {
+                    const rest = buf.subarray(end);
+                    chunks = rest.length ? [rest] : [];
+                    size = rest.length;
+                    return buf.subarray(0, end);
+                }
+                chunks = [buf];
+            }
+            const r = await reader.read();
+            if (r.done) throw new Error('stream closed');
+            reset();
+            chunks.push(r.value);
+            size += r.value.length;
+        }
+    }
+
+    try {
+        reset();
+        const resp = await fetch('stream', {
+            headers: window.getAuthHeaders ? getAuthHeaders() : {},
+            signal: ctrl.signal
+        });
+        if (resp.status === 404) return 'no stream';
+        if (!resp.ok || !resp.body) throw new Error(resp.status);
+        reader = resp.body.getReader();
+        reset();
+
+        while (true) {
+            const header = latin1.decode(await readBytes(MAX_HEADER, '\r\n\r\n'));
+            if (!header.endsWith('\r\n\r\n')) throw new Error('header too large');
+            const match = PART.exec(header);
+            if (!match) throw new Error('bad header');
+
+            const len = Number(match[1]);
+            if (!Number.isSafeInteger(len) || len > MAX_FRAME) throw new Error('frame too big');
+
+            const body = await readBytes(len + 2);
+            if (body[len] !== 13 || body[len + 1] !== 10) throw new Error('bad delimiter');
+            showFrame(new Blob([body.subarray(0, len)], { type: 'image/png' }));
+        }
+    } finally {
+        clearTimeout(timer);
+        ctrl.abort();
+        if (reader) {
+            await reader.cancel().catch(() => {});
+            reader.releaseLock();
+        }
     }
 }
 

@@ -24,6 +24,7 @@ FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
 
 SHARE_READ_S = 0.04  # viewers polling within this window reuse the last framebuffer read
+KEEPALIVE_S = 10  # /stream resends the last frame after this long without changes
 
 class FbVarScreeninfo(ctypes.Structure):
     _fields_ = [
@@ -340,7 +341,7 @@ class ScreenHandler(SimpleHTTPRequestHandler):
         # MJPEG-style multipart stream with PNG parts, pushed whenever the screen changes.
         # multipart/mixed, not x-mixed-replace: WebKit (Safari, every iOS browser) fails a
         # fetch() of an x-mixed-replace body with "Load failed". The parts are identical.
-        # The last frame is resent after 10s without changes so idle proxies keep the connection.
+        # The last frame is resent after KEEPALIVE_S without changes so idle proxies keep the connection.
         self.send_response(200)
         self.send_header('Content-Type', 'multipart/mixed; boundary=frame')
         self.send_header('Cache-Control', 'no-cache')
@@ -351,7 +352,7 @@ class ScreenHandler(SimpleHTTPRequestHandler):
         etag, last_sent = None, 0
         try:
             while True:
-                keepalive = time.monotonic() - last_sent >= 10
+                keepalive = time.monotonic() - last_sent >= KEEPALIVE_S
                 etag, png_data = self.framebuffer.get_snapshot(None if keepalive else etag)
                 if png_data:
                     self.wfile.write(b'--frame\r\nContent-Type: image/png\r\nContent-Length: %d\r\n\r\n'
